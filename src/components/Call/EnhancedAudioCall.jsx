@@ -151,7 +151,11 @@ const EnhancedAudioCall = ({
             sdp: data.answer.sdp.substring(0, 100) + '...',
             mLineCount: (data.answer.sdp.match(/^m=/gm) || []).length
           });
-          peerConnectionRef.current.setRemoteDescription(data.answer).catch((error) => {
+          peerConnectionRef.current.setRemoteDescription(data.answer).then(() => {
+            console.log('[AUDIO_CALL] 📥 Remote description set from answer');
+            // Process any queued ICE candidates now that remote description is set
+            processQueuedIceCandidates(data.callId);
+          }).catch((error) => {
             console.error('[AUDIO_CALL] ❌ Error setting remote description:', error);
           });
         }
@@ -169,9 +173,15 @@ const EnhancedAudioCall = ({
       if (data.callId === currentCallId || callStatus === 'connected' || callStatus === 'ringing') {
         console.log('[AUDIO_CALL] 🧊 Processing ICE candidate for call:', data.callId);
         if (peerConnectionRef.current && data.candidate) {
-          peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
-            console.error('[AUDIO_CALL] ❌ Error adding ICE candidate:', error);
-          });
+          // Check if remote description is set before adding ICE candidate
+          if (peerConnectionRef.current.remoteDescription) {
+            peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
+              console.error('[AUDIO_CALL] ❌ Error adding ICE candidate:', error);
+            });
+          } else {
+            console.log('[AUDIO_CALL] 🧊 Queuing ICE candidate - remote description not set yet');
+            queueSignal('ice-candidate', data);
+          }
         }
       } else {
         console.log('[AUDIO_CALL] 🧊 Queuing ICE candidate - call ID mismatch:', {
@@ -218,13 +228,22 @@ const EnhancedAudioCall = ({
         if (eventType === 'offer' && data.offer) {
           handleIncomingOffer(data.offer, data.callId);
         } else if (eventType === 'answer' && data.answer && peerConnectionRef.current) {
-          peerConnectionRef.current.setRemoteDescription(data.answer).catch((error) => {
+          peerConnectionRef.current.setRemoteDescription(data.answer).then(() => {
+            console.log('[AUDIO_CALL] 📥 Queued answer processed successfully');
+            // Process any queued ICE candidates now that remote description is set
+            processQueuedIceCandidates(data.callId);
+          }).catch((error) => {
             console.error('[AUDIO_CALL] ❌ Error processing queued answer:', error);
           });
         } else if (eventType === 'ice-candidate' && data.candidate && peerConnectionRef.current) {
-          peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
-            console.error('[AUDIO_CALL] ❌ Error processing queued ICE candidate:', error);
-          });
+          // Only add ICE candidate if remote description is set
+          if (peerConnectionRef.current.remoteDescription) {
+            peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
+              console.error('[AUDIO_CALL] ❌ Error processing queued ICE candidate:', error);
+            });
+          } else {
+            console.log('[AUDIO_CALL] 🧊 Skipping queued ICE candidate - remote description not set');
+          }
         }
       });
       setPendingSignals((prev) => ({ ...prev, [currentCallId]: [] }));
@@ -519,6 +538,9 @@ const EnhancedAudioCall = ({
       await peerConnectionRef.current.setRemoteDescription(offer);
       console.log('[AUDIO_CALL] 📥 Remote description set successfully');
       
+      // Process any queued ICE candidates now that remote description is set
+      processQueuedIceCandidates(callId);
+      
       console.log('[AUDIO_CALL] 📥 Creating answer');
       const answer = await peerConnectionRef.current.createAnswer();
       
@@ -546,6 +568,27 @@ const EnhancedAudioCall = ({
       await callService.sendIceCandidate(callId, candidate);
     } catch (error) {
       console.error('Error sending ICE candidate:', error);
+    }
+  };
+
+  const processQueuedIceCandidates = (callId) => {
+    const queuedCandidates = pendingSignals[callId]?.filter(signal => signal.eventType === 'ice-candidate') || [];
+    console.log('[AUDIO_CALL] 🧊 Processing', queuedCandidates.length, 'queued ICE candidates');
+    
+    queuedCandidates.forEach(({ data }) => {
+      if (peerConnectionRef.current && data.candidate) {
+        peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
+          console.error('[AUDIO_CALL] ❌ Error processing queued ICE candidate:', error);
+        });
+      }
+    });
+    
+    // Remove processed ICE candidates from pending signals
+    if (queuedCandidates.length > 0) {
+      setPendingSignals(prev => ({
+        ...prev,
+        [callId]: prev[callId]?.filter(signal => signal.eventType !== 'ice-candidate') || []
+      }));
     }
   };
 
