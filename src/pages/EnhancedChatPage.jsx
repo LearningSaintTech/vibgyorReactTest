@@ -233,6 +233,7 @@ const EnhancedChatPage = () => {
 
   const handleCallAccepted = useCallback((callData) => {
     console.log('[CHAT_PAGE] 📞 Call accepted:', callData);
+    console.log('[CHAT_PAGE] 🔍 Call data type:', callData.type);
     
     // Clear incoming call since it's now accepted
     setIncomingCall(null);
@@ -240,11 +241,13 @@ const EnhancedChatPage = () => {
     // Update active call status to connected using functional updates
     setActiveCall(prev => {
       console.log('[CHAT_PAGE] 🔍 Current activeCall before update:', prev);
+      console.log('[CHAT_PAGE] 🔍 Current activeCall type:', prev?.type);
       
       if (prev && prev.callId === callData.callId) {
         console.log('[CHAT_PAGE] 🔄 Updating existing activeCall status to connected');
         const updated = { ...prev, status: 'connected' };
         console.log('[CHAT_PAGE] 🔄 Updated activeCall:', updated);
+        console.log('[CHAT_PAGE] 🔄 Updated activeCall type:', updated.type);
         return updated;
       } else {
         // If no active call exists, create one with connected status
@@ -477,25 +480,29 @@ const EnhancedChatPage = () => {
       {/* Active Call Overlay */}
       {activeCall && (
         <div className="fixed inset-0 z-50 bg-black">
-          {activeCall.type === 'audio' ? (
-            <EnhancedAudioCall
-              chatId={activeCall.chatId}
-              otherUser={activeCall.otherUser}
-              callId={activeCall.callId}
-              isIncoming={activeCall.isIncoming}
-              status={activeCall.status}
-              onCallEnd={handleCallEnd}
-            />
-          ) : (
-            <EnhancedVideoCall
-              chatId={activeCall.chatId}
-              otherUser={activeCall.otherUser}
-              callId={activeCall.callId}
-              isIncoming={activeCall.isIncoming}
-              status={activeCall.status}
-              onCallEnd={handleCallEnd}
-            />
-          )}
+          {(() => {
+            console.log('[CHAT_PAGE] 🎯 Rendering call component for type:', activeCall.type);
+            console.log('[CHAT_PAGE] 🎯 Active call details:', activeCall);
+            return activeCall.type === 'audio' ? (
+              <EnhancedAudioCall
+                chatId={activeCall.chatId}
+                otherUser={activeCall.otherUser}
+                callId={activeCall.callId}
+                isIncoming={activeCall.isIncoming}
+                status={activeCall.status}
+                onCallEnd={handleCallEnd}
+              />
+            ) : (
+              <EnhancedVideoCall
+                chatId={activeCall.chatId}
+                otherUser={activeCall.otherUser}
+                callId={activeCall.callId}
+                isIncoming={activeCall.isIncoming}
+                status={activeCall.status}
+                onCallEnd={handleCallEnd}
+              />
+            );
+          })()}
         </div>
       )}
 

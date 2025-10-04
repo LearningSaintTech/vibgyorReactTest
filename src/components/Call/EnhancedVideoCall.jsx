@@ -175,13 +175,22 @@ const EnhancedVideoCall = ({
     };
 
     const handleIncomingIceCandidate = (data) => {
-      console.log('[VIDEO_CALL] 🧊 Received ICE candidate event:', data);
+      console.log('[VIDEO_CALL] 🧊 Received ICE candidate event:', {
+        callId: data.callId,
+        candidateType: data.candidate?.candidate?.split(' ')[7] || 'unknown',
+        candidateProtocol: data.candidate?.candidate?.split(' ')[2] || 'unknown',
+        candidateAddress: data.candidate?.candidate?.split(' ')[4] || 'unknown'
+      });
+      
       if (data.callId === currentCallId || callStatus === 'connected' || callStatus === 'ringing') {
         console.log('[VIDEO_CALL] 🧊 Processing ICE candidate for call:', data.callId);
         if (peerConnectionRef.current && data.candidate) {
           // Check if remote description is set before adding ICE candidate
           if (peerConnectionRef.current.remoteDescription) {
-            peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
+            console.log('[VIDEO_CALL] 🧊 Adding ICE candidate to peer connection');
+            peerConnectionRef.current.addIceCandidate(data.candidate).then(() => {
+              console.log('[VIDEO_CALL] ✅ ICE candidate added successfully');
+            }).catch((error) => {
               console.error('[VIDEO_CALL] ❌ Error adding ICE candidate:', error);
             });
           } else {
@@ -342,26 +351,64 @@ const EnhancedVideoCall = ({
       
       peerConnectionRef.current.onicecandidate = (event) => {
         if (event.candidate) {
+          console.log('[VIDEO_CALL] 🧊 Generated ICE candidate:', {
+            candidateType: event.candidate.candidate.split(' ')[7] || 'unknown',
+            candidateProtocol: event.candidate.candidate.split(' ')[2] || 'unknown',
+            candidateAddress: event.candidate.candidate.split(' ')[4] || 'unknown'
+          });
           handleIceCandidate(event.candidate, callId);
+        } else {
+          console.log('[VIDEO_CALL] 🧊 ICE gathering completed');
         }
+      };
+      
+      peerConnectionRef.current.onicegatheringstatechange = () => {
+        const state = peerConnectionRef.current.iceGatheringState;
+        console.log('[VIDEO_CALL] 🧊 ICE gathering state:', state);
       };
       
       peerConnectionRef.current.onconnectionstatechange = () => {
         const state = peerConnectionRef.current.connectionState;
-        console.log('Connection state:', state);
+        console.log('[VIDEO_CALL] 🔗 Connection state changed:', state);
         
         if (state === 'connected') {
+          console.log('[VIDEO_CALL] ✅ WebRTC connection established successfully');
           setCallStatus('connected');
           startQualityMonitoring();
-        } else if (state === 'disconnected' || state === 'failed') {
+        } else if (state === 'disconnected') {
+          console.log('[VIDEO_CALL] ⚠️ WebRTC connection disconnected');
           setCallStatus('failed');
-          setError('Connection lost');
+          setError('Connection disconnected');
+        } else if (state === 'failed') {
+          console.log('[VIDEO_CALL] ❌ WebRTC connection failed');
+          setCallStatus('failed');
+          setError('Connection failed - check network connectivity');
+        } else if (state === 'connecting') {
+          console.log('[VIDEO_CALL] 🔄 WebRTC connection in progress...');
+        } else if (state === 'new') {
+          console.log('[VIDEO_CALL] 🆕 WebRTC connection created');
+        } else if (state === 'closed') {
+          console.log('[VIDEO_CALL] 🔒 WebRTC connection closed');
         }
       };
       
       peerConnectionRef.current.onsignalingstatechange = () => {
         const state = peerConnectionRef.current.signalingState;
-        console.log('Signaling state:', state);
+        console.log('[VIDEO_CALL] 📡 Signaling state changed:', state);
+        
+        if (state === 'stable') {
+          console.log('[VIDEO_CALL] ✅ Signaling negotiation completed');
+        } else if (state === 'have-local-offer') {
+          console.log('[VIDEO_CALL] 📤 Local offer created, waiting for remote answer');
+        } else if (state === 'have-remote-offer') {
+          console.log('[VIDEO_CALL] 📥 Remote offer received, creating local answer');
+        } else if (state === 'have-local-pranswer') {
+          console.log('[VIDEO_CALL] 📤 Local provisional answer created');
+        } else if (state === 'have-remote-pranswer') {
+          console.log('[VIDEO_CALL] 📥 Remote provisional answer received');
+        } else if (state === 'closed') {
+          console.log('[VIDEO_CALL] 🔒 Signaling connection closed');
+        }
       };
       
       // Mark WebRTC as set up
@@ -381,19 +428,28 @@ const EnhancedVideoCall = ({
         throw new Error('Peer connection not initialized');
       }
       
+      console.log('[VIDEO_CALL] 📤 Creating offer for call:', callId);
       const offer = await peerConnectionRef.current.createOffer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: true
       });
+      console.log('[VIDEO_CALL] 📤 Offer created:', {
+        type: offer.type,
+        sdp: offer.sdp.substring(0, 100) + '...',
+        mLineCount: (offer.sdp.match(/^m=/gm) || []).length
+      });
       
       await peerConnectionRef.current.setLocalDescription(offer);
+      console.log('[VIDEO_CALL] 📤 Local description set from offer');
       
       // Send offer to server
+      console.log('[VIDEO_CALL] 📤 Sending offer to server');
       await callService.sendOffer(callId, offer);
+      console.log('[VIDEO_CALL] ✅ Offer sent successfully');
       
       setCallStatus('ringing');
     } catch (error) {
-      console.error('Error creating offer:', error);
+      console.error('[VIDEO_CALL] ❌ Error creating offer:', error);
       setError(error.message || 'Failed to create offer');
       setCallStatus('failed');
     }
@@ -401,7 +457,15 @@ const EnhancedVideoCall = ({
 
   const handleIncomingOffer = async (offer, callId) => {
     try {
+      console.log('[VIDEO_CALL] 📥 Handling incoming offer for call:', callId);
+      console.log('[VIDEO_CALL] 📥 Offer details:', {
+        type: offer.type,
+        sdp: offer.sdp.substring(0, 100) + '...',
+        mLineCount: (offer.sdp.match(/^m=/gm) || []).length
+      });
+      
       if (!peerConnectionRef.current) {
+        console.log('[VIDEO_CALL] 📥 Setting up WebRTC for incoming offer');
         await setupWebRTC(callId);
       }
       
@@ -411,13 +475,23 @@ const EnhancedVideoCall = ({
       // Process any queued ICE candidates now that remote description is set
       processQueuedIceCandidates(callId);
       
+      console.log('[VIDEO_CALL] 📥 Creating answer');
       const answer = await peerConnectionRef.current.createAnswer();
+      console.log('[VIDEO_CALL] 📥 Answer created:', {
+        type: answer.type,
+        sdp: answer.sdp.substring(0, 100) + '...',
+        mLineCount: (answer.sdp.match(/^m=/gm) || []).length
+      });
+      
       await peerConnectionRef.current.setLocalDescription(answer);
+      console.log('[VIDEO_CALL] 📥 Local description set from answer');
       
       // Send answer to server
+      console.log('[VIDEO_CALL] 📥 Sending answer to server');
       await callService.sendAnswer(callId, answer);
+      console.log('[VIDEO_CALL] ✅ Answer sent successfully');
     } catch (error) {
-      console.error('Error handling incoming offer:', error);
+      console.error('[VIDEO_CALL] ❌ Error handling incoming offer:', error);
       setError(error.message || 'Failed to handle incoming offer');
       setCallStatus('failed');
     }
@@ -425,9 +499,15 @@ const EnhancedVideoCall = ({
 
   const handleIceCandidate = async (candidate, callId) => {
     try {
+      console.log('[VIDEO_CALL] 🧊 Sending ICE candidate:', {
+        candidateType: candidate.candidate.split(' ')[7] || 'unknown',
+        candidateProtocol: candidate.candidate.split(' ')[2] || 'unknown',
+        candidateAddress: candidate.candidate.split(' ')[4] || 'unknown'
+      });
       await callService.sendIceCandidate(callId, candidate);
+      console.log('[VIDEO_CALL] ✅ ICE candidate sent successfully');
     } catch (error) {
-      console.error('Error sending ICE candidate:', error);
+      console.error('[VIDEO_CALL] ❌ Error sending ICE candidate:', error);
     }
   };
 
@@ -736,6 +816,35 @@ const EnhancedVideoCall = ({
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Debug function to test connection
+  const testConnection = () => {
+    console.log('[VIDEO_CALL] 🔍 === CONNECTION DEBUG TEST ===');
+    console.log('[VIDEO_CALL] 🔍 Call Status:', callStatus);
+    console.log('[VIDEO_CALL] 🔍 Peer Connection:', !!peerConnectionRef.current);
+    
+    if (peerConnectionRef.current) {
+      console.log('[VIDEO_CALL] 🔍 Connection State:', peerConnectionRef.current.connectionState);
+      console.log('[VIDEO_CALL] 🔍 Signaling State:', peerConnectionRef.current.signalingState);
+      console.log('[VIDEO_CALL] 🔍 ICE Gathering State:', peerConnectionRef.current.iceGatheringState);
+      console.log('[VIDEO_CALL] 🔍 ICE Connection State:', peerConnectionRef.current.iceConnectionState);
+      console.log('[VIDEO_CALL] 🔍 Local Description:', !!peerConnectionRef.current.localDescription);
+      console.log('[VIDEO_CALL] 🔍 Remote Description:', !!peerConnectionRef.current.remoteDescription);
+      
+      if (peerConnectionRef.current.localDescription) {
+        console.log('[VIDEO_CALL] 🔍 Local SDP Type:', peerConnectionRef.current.localDescription.type);
+      }
+      if (peerConnectionRef.current.remoteDescription) {
+        console.log('[VIDEO_CALL] 🔍 Remote SDP Type:', peerConnectionRef.current.remoteDescription.type);
+      }
+    }
+    
+    console.log('[VIDEO_CALL] 🔍 Local Stream:', !!localStreamRef.current);
+    console.log('[VIDEO_CALL] 🔍 Remote Video Element:', !!remoteVideoRef.current);
+    console.log('[VIDEO_CALL] 🔍 Local Video Element:', !!localVideoRef.current);
+    console.log('[VIDEO_CALL] 🔍 Pending Signals:', Object.keys(pendingSignals).length);
+    console.log('[VIDEO_CALL] 🔍 === END DEBUG TEST ===');
+  };
+
   const getStatusText = () => {
     switch (callStatus) {
       case 'initiating':
@@ -940,6 +1049,17 @@ const EnhancedVideoCall = ({
           className="w-12 h-12 rounded-full bg-black/50 hover:bg-black/70"
         >
           {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
+        </Button>
+
+        {/* Debug Test Button */}
+        <Button
+          variant="ghost"
+          size="lg"
+          onClick={testConnection}
+          className="w-12 h-12 rounded-full bg-blue-500/50 hover:bg-blue-500/70"
+          title="Debug Connection"
+        >
+          🔍
         </Button>
 
         {/* Settings */}
