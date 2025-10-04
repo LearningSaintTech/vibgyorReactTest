@@ -15,6 +15,7 @@ import {
   Minimize
 } from 'lucide-react';
 import callService from '../../services/enhancedCallService';
+import enhancedSocketService from '../../services/enhancedSocketService';
 import { useAuth } from '../../contexts/AuthContext';
 import LoadingSpinner from '../UI/LoadingSpinner';
 import Button from '../UI/Button';
@@ -44,6 +45,16 @@ const EnhancedVideoCall = ({
   const [showSettings, setShowSettings] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [localVideoSize, setLocalVideoSize] = useState('small'); // small, medium, large
+  const [pendingSignals, setPendingSignals] = useState({});
+  
+  // Helper function to queue signals for later processing
+  const queueSignal = useCallback((eventType, data) => {
+    setPendingSignals((prev) => ({
+      ...prev,
+      [data.callId]: [...(prev[data.callId] || []), { eventType, data }],
+    }));
+    console.log(`[VIDEO_CALL] 💾 Queued ${eventType} for call:`, data.callId);
+  }, []);
   
   // Refs
   const localVideoRef = useRef(null);
@@ -53,6 +64,8 @@ const EnhancedVideoCall = ({
   const screenStreamRef = useRef(null);
   const durationIntervalRef = useRef(null);
   const qualityCheckIntervalRef = useRef(null);
+  const isWebRTCSetupRef = useRef(false);
+  const currentCallIdRef = useRef(null);
   
   // WebRTC configuration
   const rtcConfig = {
@@ -107,12 +120,155 @@ const EnhancedVideoCall = ({
     };
   }, []);
 
+  // Set up socket listeners for signaling (non-persistent, tied to callId changes)
+  useEffect(() => {
+    const currentCallId = propCallId || incomingCallData?.callId;
+    if (!currentCallId) {
+      console.log('[VIDEO_CALL] ⚠️ No call ID, skipping listener setup');
+      return;
+    }
+
+    console.log('[VIDEO_CALL] 🔌 Registering WebRTC socket listeners for call ID:', currentCallId);
+
+    // Define handlers with callId check
+    const handleIncomingOfferEvent = (data) => {
+      console.log('[VIDEO_CALL] 📥 Received offer event:', data);
+      if (data.callId === currentCallId || callStatus === 'connected' || callStatus === 'ringing') {
+        console.log('[VIDEO_CALL] 📥 Processing offer for call:', data.callId);
+        if (data.offer) {
+          handleIncomingOffer(data.offer, data.callId);
+        }
+      } else {
+        console.log('[VIDEO_CALL] 📥 Queuing offer - call ID mismatch:', {
+          eventCallId: data.callId,
+          currentCallId,
+        });
+        queueSignal('offer', data);
+      }
+    };
+
+    const handleIncomingAnswer = (data) => {
+      console.log('[VIDEO_CALL] 📥 Received answer event:', data);
+      if (data.callId === currentCallId || callStatus === 'connected' || callStatus === 'ringing') {
+        console.log('[VIDEO_CALL] 📥 Processing answer for call:', data.callId);
+        if (peerConnectionRef.current && data.answer && !peerConnectionRef.current.remoteDescription) {
+          console.log('[VIDEO_CALL] 📥 Setting remote description from answer:', {
+            type: data.answer.type,
+            sdp: data.answer.sdp.substring(0, 100) + '...',
+            mLineCount: (data.answer.sdp.match(/^m=/gm) || []).length
+          });
+          peerConnectionRef.current.setRemoteDescription(data.answer).then(() => {
+            console.log('[VIDEO_CALL] 📥 Remote description set from answer');
+            // Process any queued ICE candidates now that remote description is set
+            processQueuedIceCandidates(data.callId);
+          }).catch((error) => {
+            console.error('[VIDEO_CALL] ❌ Error setting remote description:', error);
+          });
+        }
+      } else {
+        console.log('[VIDEO_CALL] 📥 Queuing answer - call ID mismatch:', {
+          eventCallId: data.callId,
+          currentCallId,
+        });
+        queueSignal('answer', data);
+      }
+    };
+
+    const handleIncomingIceCandidate = (data) => {
+      console.log('[VIDEO_CALL] 🧊 Received ICE candidate event:', data);
+      if (data.callId === currentCallId || callStatus === 'connected' || callStatus === 'ringing') {
+        console.log('[VIDEO_CALL] 🧊 Processing ICE candidate for call:', data.callId);
+        if (peerConnectionRef.current && data.candidate) {
+          // Check if remote description is set before adding ICE candidate
+          if (peerConnectionRef.current.remoteDescription) {
+            peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
+              console.error('[VIDEO_CALL] ❌ Error adding ICE candidate:', error);
+            });
+          } else {
+            console.log('[VIDEO_CALL] 🧊 Queuing ICE candidate - remote description not set yet');
+            queueSignal('ice-candidate', data);
+          }
+        }
+      } else {
+        console.log('[VIDEO_CALL] 🧊 Queuing ICE candidate - call ID mismatch:', {
+          eventCallId: data.callId,
+          currentCallId,
+        });
+        queueSignal('ice-candidate', data);
+      }
+    };
+
+    // Register listeners
+    enhancedSocketService.on('webrtc_offer', handleIncomingOfferEvent);
+    enhancedSocketService.on('webrtc_answer', handleIncomingAnswer);
+    enhancedSocketService.on('webrtc_ice_candidate', handleIncomingIceCandidate);
+    enhancedSocketService.on('webrtc:offer', handleIncomingOfferEvent);
+    enhancedSocketService.on('webrtc:answer', handleIncomingAnswer);
+    enhancedSocketService.on('webrtc:ice-candidate', handleIncomingIceCandidate);
+
+    // Debug listener state
+    setTimeout(() => {
+      console.log('[VIDEO_CALL] 🔍 Checking listeners after registration...');
+      enhancedSocketService.getListenersDebugInfo();
+    }, 100);
+
+    // Cleanup listeners on unmount or callId change
+    return () => {
+      console.log('[VIDEO_CALL] 🧹 Removing WebRTC socket listeners for call ID:', currentCallId);
+      enhancedSocketService.off('webrtc_offer', handleIncomingOfferEvent);
+      enhancedSocketService.off('webrtc_answer', handleIncomingAnswer);
+      enhancedSocketService.off('webrtc_ice_candidate', handleIncomingIceCandidate);
+      enhancedSocketService.off('webrtc:offer', handleIncomingOfferEvent);
+      enhancedSocketService.off('webrtc:answer', handleIncomingAnswer);
+      enhancedSocketService.off('webrtc:ice-candidate', handleIncomingIceCandidate);
+      console.log('[VIDEO_CALL] ✅ WebRTC socket listeners removed');
+    };
+  }, [propCallId, incomingCallData?.callId, callStatus, queueSignal]); // Re-run on callId or callStatus change
+
+  // Process queued signals when callId updates
+  useEffect(() => {
+    const currentCallId = propCallId || incomingCallData?.callId;
+    if (currentCallId && pendingSignals[currentCallId]) {
+      console.log('[VIDEO_CALL] 🔄 Processing queued signals for call:', currentCallId);
+      pendingSignals[currentCallId].forEach(({ eventType, data }) => {
+        if (eventType === 'offer' && data.offer) {
+          handleIncomingOffer(data.offer, data.callId);
+        } else if (eventType === 'answer' && data.answer && peerConnectionRef.current) {
+          peerConnectionRef.current.setRemoteDescription(data.answer).then(() => {
+            console.log('[VIDEO_CALL] 📥 Queued answer processed successfully');
+            // Process any queued ICE candidates now that remote description is set
+            processQueuedIceCandidates(data.callId);
+          }).catch((error) => {
+            console.error('[VIDEO_CALL] ❌ Error processing queued answer:', error);
+          });
+        } else if (eventType === 'ice-candidate' && data.candidate && peerConnectionRef.current) {
+          // Only add ICE candidate if remote description is set
+          if (peerConnectionRef.current.remoteDescription) {
+            peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
+              console.error('[VIDEO_CALL] ❌ Error processing queued ICE candidate:', error);
+            });
+          } else {
+            console.log('[VIDEO_CALL] 🧊 Skipping queued ICE candidate - remote description not set');
+          }
+        }
+      });
+      setPendingSignals((prev) => ({ ...prev, [currentCallId]: [] }));
+    }
+  }, [propCallId, incomingCallData?.callId, pendingSignals]);
+
   const initializeCall = async () => {
     try {
       const currentCallId = propCallId || incomingCallData?.callId;
       
       if (!currentCallId) {
         throw new Error('Call ID is required');
+      }
+      
+      // Update current call ID reference
+      if (currentCallId !== currentCallIdRef.current) {
+        console.log('[VIDEO_CALL] 🔄 Call ID changed, cleaning up previous connection');
+        cleanup();
+        currentCallIdRef.current = currentCallId;
       }
 
       // Get call status from server
@@ -208,6 +364,10 @@ const EnhancedVideoCall = ({
         console.log('Signaling state:', state);
       };
       
+      // Mark WebRTC as set up
+      isWebRTCSetupRef.current = true;
+      console.log('[VIDEO_CALL] ✅ WebRTC setup completed');
+      
     } catch (error) {
       console.error('Error setting up WebRTC:', error);
       setError(error.message || 'Failed to setup call');
@@ -246,6 +406,10 @@ const EnhancedVideoCall = ({
       }
       
       await peerConnectionRef.current.setRemoteDescription(offer);
+      console.log('[VIDEO_CALL] 📥 Remote description set successfully');
+      
+      // Process any queued ICE candidates now that remote description is set
+      processQueuedIceCandidates(callId);
       
       const answer = await peerConnectionRef.current.createAnswer();
       await peerConnectionRef.current.setLocalDescription(answer);
@@ -264,6 +428,27 @@ const EnhancedVideoCall = ({
       await callService.sendIceCandidate(callId, candidate);
     } catch (error) {
       console.error('Error sending ICE candidate:', error);
+    }
+  };
+
+  const processQueuedIceCandidates = (callId) => {
+    const queuedCandidates = pendingSignals[callId]?.filter(signal => signal.eventType === 'ice-candidate') || [];
+    console.log('[VIDEO_CALL] 🧊 Processing', queuedCandidates.length, 'queued ICE candidates');
+    
+    queuedCandidates.forEach(({ data }) => {
+      if (peerConnectionRef.current && data.candidate) {
+        peerConnectionRef.current.addIceCandidate(data.candidate).catch((error) => {
+          console.error('[VIDEO_CALL] ❌ Error processing queued ICE candidate:', error);
+        });
+      }
+    });
+    
+    // Remove processed ICE candidates from pending signals
+    if (queuedCandidates.length > 0) {
+      setPendingSignals(prev => ({
+        ...prev,
+        [callId]: prev[callId]?.filter(signal => signal.eventType !== 'ice-candidate') || []
+      }));
     }
   };
 
@@ -520,6 +705,9 @@ const EnhancedVideoCall = ({
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
     }
+    
+    // Reset WebRTC setup flag
+    isWebRTCSetupRef.current = false;
     
     // Clear intervals
     if (durationIntervalRef.current) {
