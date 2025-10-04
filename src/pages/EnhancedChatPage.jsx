@@ -228,8 +228,19 @@ const EnhancedChatPage = () => {
 
   const handleIncomingCall = useCallback((callData) => {
     console.log('[CHAT_PAGE] 📞 Incoming call received:', callData);
+    
+    // Check if this is the same call that's already active
+    if (activeCall && activeCall.callId === callData.callId) {
+      console.log('[CHAT_PAGE] 📞 Call already active, updating status to connected');
+      setActiveCall(prev => ({
+        ...prev,
+        status: 'connected'
+      }));
+      return;
+    }
+    
     setIncomingCall(callData);
-  }, []);
+  }, [activeCall]);
 
   const handleCallAccepted = useCallback((callData) => {
     console.log('[CHAT_PAGE] 📞 Call accepted:', callData);
@@ -291,6 +302,17 @@ const EnhancedChatPage = () => {
     if (!incomingCall) return;
 
     try {
+      // Check if there's already an active call with the same ID
+      if (activeCall && activeCall.callId === incomingCall.callId) {
+        console.log('[CHAT_PAGE] 📞 Call already active, updating status to connected');
+        setActiveCall(prev => ({
+          ...prev,
+          status: 'connected'
+        }));
+        setIncomingCall(null);
+        return;
+      }
+
       const result = await callService.acceptCall(incomingCall.callId);
       
       if (result.success) {
@@ -306,10 +328,25 @@ const EnhancedChatPage = () => {
       }
     } catch (error) {
       console.error('Error accepting incoming call:', error);
-      setError(error.message || 'Failed to accept call');
-      setIncomingCall(null);
+      
+      // If the error is about call not being in ringing state, it might already be connected
+      if (error.message && error.message.includes('not in ringing state')) {
+        console.log('[CHAT_PAGE] 📞 Call already connected, updating active call status');
+        setActiveCall({
+          callId: incomingCall.callId,
+          chatId: incomingCall.chatId,
+          type: incomingCall.type,
+          status: 'connected',
+          otherUser: incomingCall.otherUser,
+          isIncoming: false
+        });
+        setIncomingCall(null);
+      } else {
+        setError(error.message || 'Failed to accept call');
+        setIncomingCall(null);
+      }
     }
-  }, [incomingCall]);
+  }, [incomingCall, activeCall]);
 
   const handleRejectIncomingCall = useCallback(async () => {
     if (!incomingCall) return;
@@ -500,7 +537,7 @@ const EnhancedChatPage = () => {
       )}
 
       {/* Enhanced Incoming Call Notification */}
-      {incomingCall && !activeCall && (
+      {incomingCall && !activeCall && incomingCall.callId !== activeCall?.callId && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-6">
           <div className="bg-white/95 dark:bg-gray-800/95 backdrop-blur-md rounded-3xl p-8 max-w-md w-full shadow-large border border-gray-200/50 dark:border-gray-700/50 animate-bounce-in">
             <div className="text-center">

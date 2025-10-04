@@ -15,6 +15,7 @@ import {
   Minimize
 } from 'lucide-react';
 import callService from '../../services/enhancedCallService';
+import enhancedSocketService from '../../services/enhancedSocketService';
 import { useAuth } from '../../contexts/AuthContext';
 import LoadingSpinner from '../UI/LoadingSpinner';
 import Button from '../UI/Button';
@@ -28,6 +29,7 @@ const EnhancedVideoCall = ({
   isIncoming = false, 
   incomingCallData = null,
   callId: propCallId = null,
+  status: propStatus = null,
   onCallEnd 
 }) => {
   const { user } = useAuth();
@@ -44,6 +46,45 @@ const EnhancedVideoCall = ({
   const [showSettings, setShowSettings] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [localVideoSize, setLocalVideoSize] = useState('small'); // small, medium, large
+  const [pendingSignals, setPendingSignals] = useState({});
+  
+  // Helper function to queue signals for later processing
+  const queueSignal = useCallback((eventType, data) => {
+    setPendingSignals((prev) => ({
+      ...prev,
+      [data.callId]: [...(prev[data.callId] || []), { eventType, data }],
+    }));
+    console.log(`[VIDEO_CALL] 💾 Queued ${eventType} for call:`, data.callId);
+  }, []);
+  
+  // Update internal call status when prop status changes
+  useEffect(() => {
+    if (propStatus) {
+      console.log('[VIDEO_CALL] 🔄 Updating call status from prop:', propStatus);
+      setCallStatus(propStatus);
+    }
+  }, [propStatus]);
+
+  // Update call ID when props change
+  useEffect(() => {
+    const newCallId = propCallId || incomingCallData?.callId;
+    if (newCallId) {
+      console.log('[VIDEO_CALL] 🔄 Call ID updated:', newCallId);
+    }
+  }, [propCallId, incomingCallData?.callId]);
+  
+  // Log initial call settings
+  useEffect(() => {
+    console.log('[VIDEO_CALL] ⚙️ Initial call settings:', {
+      isMuted: isMuted,
+      isVideoEnabled: isVideoEnabled,
+      isScreenSharing: isScreenSharing,
+      isSpeakerEnabled: isSpeakerEnabled,
+      callStatus: callStatus,
+      isIncoming: isIncoming,
+      otherUser: otherUser?.username || 'Unknown'
+    });
+  }, []);
   
   // Refs
   const localVideoRef = useRef(null);
@@ -53,6 +94,8 @@ const EnhancedVideoCall = ({
   const screenStreamRef = useRef(null);
   const durationIntervalRef = useRef(null);
   const qualityCheckIntervalRef = useRef(null);
+  const isWebRTCSetupRef = useRef(false);
+  const currentCallIdRef = useRef(null);
   
   // WebRTC configuration
   const rtcConfig = {
@@ -66,14 +109,106 @@ const EnhancedVideoCall = ({
 
   // Initialize call
   useEffect(() => {
-    if (propCallId || incomingCallData?.callId) {
+    const currentCallId = propCallId || incomingCallData?.callId;
+    
+    if (currentCallId && currentCallId !== currentCallIdRef.current) {
+      console.log('[VIDEO_CALL] 🔄 Call ID changed, cleaning up previous connection');
+      cleanup();
+      currentCallIdRef.current = currentCallId;
       initializeCall();
     }
     
     return () => {
-      cleanup();
+      // Only cleanup on unmount, not on every render
+      if (!propCallId && !incomingCallData?.callId) {
+        cleanup();
+      }
     };
   }, [propCallId, incomingCallData?.callId, isIncoming]);
+  
+  // Set up socket listeners for signaling (non-persistent, tied to callId changes)
+  useEffect(() => {
+    const currentCallId = propCallId || incomingCallData?.callId;
+    
+    if (!currentCallId) {
+      console.log('[VIDEO_CALL] ⚠️ No call ID available for socket listeners');
+      return;
+    }
+    
+    console.log('[VIDEO_CALL] 🔌 Setting up socket listeners for call:', currentCallId);
+    
+    // WebRTC signaling event handlers
+    const handleWebRTCOffer = (data) => {
+      console.log('[VIDEO_CALL] 📡 Received WebRTC offer:', data);
+      if (data.callId === currentCallId) {
+        handleIncomingOffer(data.offer, currentCallId);
+      } else {
+        console.log('[VIDEO_CALL] ⚠️ Offer for different call ID, queuing...');
+        queueSignal('webrtc_offer', data);
+      }
+    };
+    
+    const handleWebRTCAnswer = (data) => {
+      console.log('[VIDEO_CALL] 📡 Received WebRTC answer:', data);
+      if (data.callId === currentCallId) {
+        handleIncomingAnswer(data.answer, currentCallId);
+      } else {
+        console.log('[VIDEO_CALL] ⚠️ Answer for different call ID, queuing...');
+        queueSignal('webrtc_answer', data);
+      }
+    };
+    
+    const handleWebRTCCandidate = (data) => {
+      console.log('[VIDEO_CALL] 📡 Received WebRTC ICE candidate:', data);
+      if (data.callId === currentCallId) {
+        handleIncomingIceCandidate(data.candidate, currentCallId);
+      } else {
+        console.log('[VIDEO_CALL] ⚠️ ICE candidate for different call ID, queuing...');
+        queueSignal('webrtc_ice_candidate', data);
+      }
+    };
+    
+    // Register event listeners
+    enhancedSocketService.on('webrtc_offer', handleWebRTCOffer);
+    enhancedSocketService.on('webrtc_answer', handleWebRTCAnswer);
+    enhancedSocketService.on('webrtc_ice_candidate', handleWebRTCCandidate);
+    
+    // Process any pending signals for this call
+    const pendingCallSignals = pendingSignals[currentCallId] || [];
+    console.log('[VIDEO_CALL] 🔄 Processing', pendingCallSignals.length, 'pending signals for call:', currentCallId);
+    
+    pendingCallSignals.forEach(({ eventType, data }) => {
+      console.log('[VIDEO_CALL] 🔄 Processing pending signal:', eventType);
+      switch (eventType) {
+        case 'webrtc_offer':
+          handleIncomingOffer(data.offer, currentCallId);
+          break;
+        case 'webrtc_answer':
+          handleIncomingAnswer(data.answer, currentCallId);
+          break;
+        case 'webrtc_ice_candidate':
+          handleIncomingIceCandidate(data.candidate, currentCallId);
+          break;
+      }
+    });
+    
+    // Clear processed signals
+    if (pendingCallSignals.length > 0) {
+      setPendingSignals(prev => {
+        const updated = { ...prev };
+        delete updated[currentCallId];
+        return updated;
+      });
+    }
+    
+    // Cleanup function
+    return () => {
+      console.log('[VIDEO_CALL] 🧹 Cleaning up socket listeners for call:', currentCallId);
+      enhancedSocketService.off('webrtc_offer', handleWebRTCOffer);
+      enhancedSocketService.off('webrtc_answer', handleWebRTCAnswer);
+      enhancedSocketService.off('webrtc_ice_candidate', handleWebRTCCandidate);
+    };
+  }, [propCallId, incomingCallData?.callId, queueSignal, pendingSignals]);
 
   // Update call duration
   useEffect(() => {
@@ -144,39 +279,69 @@ const EnhancedVideoCall = ({
 
   const setupWebRTC = async (callId) => {
     try {
-      // Create peer connection
+      // Prevent multiple WebRTC setups
+      if (isWebRTCSetupRef.current && peerConnectionRef.current) {
+        console.log('[VIDEO_CALL] ⚠️ WebRTC already set up, skipping...');
+        return;
+      }
+      
+      console.log('[VIDEO_CALL] 🔧 Setting up WebRTC for call:', callId);
+      
+      // Clean up any existing connection
+      if (peerConnectionRef.current) {
+        console.log('[VIDEO_CALL] 🧹 Cleaning up existing peer connection');
+        peerConnectionRef.current.close();
+        peerConnectionRef.current = null;
+      }
+      
+      // Create new peer connection
       peerConnectionRef.current = new RTCPeerConnection(rtcConfig);
+      console.log('[VIDEO_CALL] ✅ New peer connection created');
       
-      // Get user media
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        },
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 30 }
+      // Get user media only if not already obtained
+      if (!localStreamRef.current) {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 }
+          }
+        });
+        
+        console.log('[VIDEO_CALL] 🎥 Video stream obtained:', {
+          streamId: stream.id,
+          audioTracks: stream.getAudioTracks().length,
+          videoTracks: stream.getVideoTracks().length,
+          audioTrackEnabled: stream.getAudioTracks()[0]?.enabled,
+          videoTrackEnabled: stream.getVideoTracks()[0]?.enabled,
+          audioTrackMuted: stream.getAudioTracks()[0]?.muted,
+          videoTrackMuted: stream.getVideoTracks()[0]?.muted
+        });
+        
+        localStreamRef.current = stream;
+        
+        // Set up video elements
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+          localVideoRef.current.muted = true; // Mute local audio to prevent feedback
         }
-      });
-      
-      localStreamRef.current = stream;
+      }
       
       // Add tracks to peer connection
-      stream.getTracks().forEach(track => {
-        peerConnectionRef.current.addTrack(track, stream);
+      localStreamRef.current.getTracks().forEach(track => {
+        peerConnectionRef.current.addTrack(track, localStreamRef.current);
       });
       
-      // Set up video elements
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-        localVideoRef.current.muted = true; // Mute local audio to prevent feedback
-      }
+      console.log('[VIDEO_CALL] ✅ Tracks added to peer connection');
       
       // Set up peer connection event handlers
       peerConnectionRef.current.ontrack = (event) => {
-        console.log('Received remote track');
+        console.log('[VIDEO_CALL] 📺 Received remote track');
         const [remoteStream] = event.streams;
         
         if (remoteVideoRef.current) {
@@ -192,7 +357,7 @@ const EnhancedVideoCall = ({
       
       peerConnectionRef.current.onconnectionstatechange = () => {
         const state = peerConnectionRef.current.connectionState;
-        console.log('Connection state:', state);
+        console.log('[VIDEO_CALL] 🔗 Connection state:', state);
         
         if (state === 'connected') {
           setCallStatus('connected');
@@ -205,11 +370,18 @@ const EnhancedVideoCall = ({
       
       peerConnectionRef.current.onsignalingstatechange = () => {
         const state = peerConnectionRef.current.signalingState;
-        console.log('Signaling state:', state);
+        console.log('[VIDEO_CALL] 📡 Signaling state:', state);
       };
       
+      peerConnectionRef.current.onicegatheringstatechange = () => {
+        const state = peerConnectionRef.current.iceGatheringState;
+        console.log('[VIDEO_CALL] 🧊 ICE gathering state:', state);
+      };
+      
+      isWebRTCSetupRef.current = true;
+      
     } catch (error) {
-      console.error('Error setting up WebRTC:', error);
+      console.error('[VIDEO_CALL] ❌ Error setting up WebRTC:', error);
       setError(error.message || 'Failed to setup call');
       setCallStatus('failed');
     }
@@ -221,19 +393,34 @@ const EnhancedVideoCall = ({
         throw new Error('Peer connection not initialized');
       }
       
+      // Check if we already have a local description (prevent multiple offers)
+      if (peerConnectionRef.current.localDescription) {
+        console.log('[VIDEO_CALL] ⚠️ Offer already created, skipping...');
+        return;
+      }
+      
+      console.log('[VIDEO_CALL] 📤 Creating offer for call:', callId);
       const offer = await peerConnectionRef.current.createOffer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: true
       });
       
+      console.log('[VIDEO_CALL] 📤 Offer created:', {
+        type: offer.type,
+        sdp: offer.sdp.substring(0, 100) + '...',
+        mLineCount: (offer.sdp.match(/^m=/gm) || []).length
+      });
+      
       await peerConnectionRef.current.setLocalDescription(offer);
+      console.log('[VIDEO_CALL] 📤 Local description set');
       
       // Send offer to server
       await callService.sendOffer(callId, offer);
+      console.log('[VIDEO_CALL] 📤 Offer sent to server');
       
       setCallStatus('ringing');
     } catch (error) {
-      console.error('Error creating offer:', error);
+      console.error('[VIDEO_CALL] ❌ Error creating offer:', error);
       setError(error.message || 'Failed to create offer');
       setCallStatus('failed');
     }
@@ -241,21 +428,93 @@ const EnhancedVideoCall = ({
 
   const handleIncomingOffer = async (offer, callId) => {
     try {
+      console.log('[VIDEO_CALL] 📥 Handling incoming offer for call:', callId);
+      
       if (!peerConnectionRef.current) {
+        console.log('[VIDEO_CALL] 📥 Setting up WebRTC for incoming call');
         await setupWebRTC(callId);
       }
       
-      await peerConnectionRef.current.setRemoteDescription(offer);
+      // Check if we already have a remote description (prevent duplicate processing)
+      if (peerConnectionRef.current.remoteDescription) {
+        console.log('[VIDEO_CALL] ⚠️ Remote description already set, skipping...');
+        return;
+      }
       
+      console.log('[VIDEO_CALL] 📥 Setting remote description:', {
+        type: offer.type,
+        sdp: offer.sdp.substring(0, 100) + '...',
+        mLineCount: (offer.sdp.match(/^m=/gm) || []).length
+      });
+      
+      await peerConnectionRef.current.setRemoteDescription(offer);
+      console.log('[VIDEO_CALL] 📥 Remote description set successfully');
+      
+      console.log('[VIDEO_CALL] 📥 Creating answer');
       const answer = await peerConnectionRef.current.createAnswer();
+      
+      console.log('[VIDEO_CALL] 📥 Answer created:', {
+        type: answer.type,
+        sdp: answer.sdp.substring(0, 100) + '...',
+        mLineCount: (answer.sdp.match(/^m=/gm) || []).length
+      });
+      
       await peerConnectionRef.current.setLocalDescription(answer);
+      console.log('[VIDEO_CALL] 📥 Local description set');
       
       // Send answer to server
       await callService.sendAnswer(callId, answer);
+      console.log('[VIDEO_CALL] 📥 Answer sent to server');
     } catch (error) {
-      console.error('Error handling incoming offer:', error);
+      console.error('[VIDEO_CALL] ❌ Error handling incoming offer:', error);
       setError(error.message || 'Failed to handle incoming offer');
       setCallStatus('failed');
+    }
+  };
+
+  const handleIncomingAnswer = async (answer, callId) => {
+    try {
+      console.log('[VIDEO_CALL] 📥 Handling incoming answer for call:', callId);
+      
+      if (!peerConnectionRef.current) {
+        console.log('[VIDEO_CALL] ⚠️ No peer connection available for answer');
+        return;
+      }
+      
+      // Check if we already have a remote description (prevent duplicate processing)
+      if (peerConnectionRef.current.remoteDescription) {
+        console.log('[VIDEO_CALL] ⚠️ Remote description already set, skipping answer...');
+        return;
+      }
+      
+      console.log('[VIDEO_CALL] 📥 Setting remote description (answer):', {
+        type: answer.type,
+        sdp: answer.sdp.substring(0, 100) + '...',
+        mLineCount: (answer.sdp.match(/^m=/gm) || []).length
+      });
+      
+      await peerConnectionRef.current.setRemoteDescription(answer);
+      console.log('[VIDEO_CALL] 📥 Remote description (answer) set successfully');
+    } catch (error) {
+      console.error('[VIDEO_CALL] ❌ Error handling incoming answer:', error);
+      setError(error.message || 'Failed to handle incoming answer');
+      setCallStatus('failed');
+    }
+  };
+
+  const handleIncomingIceCandidate = async (candidate, callId) => {
+    try {
+      console.log('[VIDEO_CALL] 📥 Handling incoming ICE candidate for call:', callId);
+      
+      if (!peerConnectionRef.current) {
+        console.log('[VIDEO_CALL] ⚠️ No peer connection available for ICE candidate');
+        return;
+      }
+      
+      await peerConnectionRef.current.addIceCandidate(candidate);
+      console.log('[VIDEO_CALL] 📥 ICE candidate added successfully');
+    } catch (error) {
+      console.error('[VIDEO_CALL] ❌ Error handling incoming ICE candidate:', error);
     }
   };
 
@@ -263,7 +522,7 @@ const EnhancedVideoCall = ({
     try {
       await callService.sendIceCandidate(callId, candidate);
     } catch (error) {
-      console.error('Error sending ICE candidate:', error);
+      console.error('[VIDEO_CALL] ❌ Error sending ICE candidate:', error);
     }
   };
 
@@ -286,9 +545,21 @@ const EnhancedVideoCall = ({
         }
       }
     } catch (error) {
-      console.error('Error accepting call:', error);
-      setError(error.message || 'Failed to accept call');
-      setCallStatus('failed');
+      console.error('[VIDEO_CALL] ❌ Error accepting call:', error);
+      
+      // If the error is about call not being in ringing state, it might already be connected
+      if (error.message && error.message.includes('not in ringing state')) {
+        console.log('[VIDEO_CALL] 📞 Call already connected, updating status');
+        setCallStatus('connected');
+        
+        // Process any pending offer
+        if (incomingCallData?.signalingData?.offer) {
+          await handleIncomingOffer(incomingCallData.signalingData.offer, currentCallId);
+        }
+      } else {
+        setError(error.message || 'Failed to accept call');
+        setCallStatus('failed');
+      }
     }
   };
 
@@ -305,7 +576,7 @@ const EnhancedVideoCall = ({
         onCallEnd();
       }
     } catch (error) {
-      console.error('Error rejecting call:', error);
+      console.error('[VIDEO_CALL] ❌ Error rejecting call:', error);
       setCallStatus('rejected');
       if (onCallEnd) {
         onCallEnd();
@@ -328,7 +599,7 @@ const EnhancedVideoCall = ({
         onCallEnd();
       }
     } catch (error) {
-      console.error('Error ending call:', error);
+      console.error('[VIDEO_CALL] ❌ Error ending call:', error);
       setCallStatus('ended');
       cleanup();
       
@@ -342,8 +613,17 @@ const EnhancedVideoCall = ({
     if (localStreamRef.current) {
       const audioTrack = localStreamRef.current.getAudioTracks()[0];
       if (audioTrack) {
+        const wasEnabled = audioTrack.enabled;
         audioTrack.enabled = !audioTrack.enabled;
         setIsMuted(!audioTrack.enabled);
+        
+        console.log('[VIDEO_CALL] 🔇 Mute toggle:', {
+          wasEnabled,
+          nowEnabled: audioTrack.enabled,
+          isMuted: !audioTrack.enabled,
+          trackMuted: audioTrack.muted,
+          trackKind: audioTrack.kind
+        });
         
         // Update call settings
         const currentCallId = propCallId || incomingCallData?.callId;
@@ -360,8 +640,17 @@ const EnhancedVideoCall = ({
     if (localStreamRef.current) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0];
       if (videoTrack) {
+        const wasEnabled = videoTrack.enabled;
         videoTrack.enabled = !videoTrack.enabled;
         setIsVideoEnabled(videoTrack.enabled);
+        
+        console.log('[VIDEO_CALL] 📹 Video toggle:', {
+          wasEnabled,
+          nowEnabled: videoTrack.enabled,
+          isVideoEnabled: videoTrack.enabled,
+          trackMuted: videoTrack.muted,
+          trackKind: videoTrack.kind
+        });
         
         // Update call settings
         const currentCallId = propCallId || incomingCallData?.callId;
@@ -447,10 +736,21 @@ const EnhancedVideoCall = ({
   };
 
   const toggleSpeaker = () => {
-    setIsSpeakerEnabled(!isSpeakerEnabled);
+    const newSpeakerState = !isSpeakerEnabled;
+    setIsSpeakerEnabled(newSpeakerState);
+    
+    console.log('[VIDEO_CALL] 🔊 Speaker toggle:', {
+      wasEnabled: isSpeakerEnabled,
+      nowEnabled: newSpeakerState,
+      remoteVideoMuted: newSpeakerState
+    });
     
     if (remoteVideoRef.current) {
-      remoteVideoRef.current.muted = isSpeakerEnabled;
+      remoteVideoRef.current.muted = newSpeakerState;
+      console.log('[VIDEO_CALL] 🔊 Remote video element updated:', {
+        muted: remoteVideoRef.current.muted,
+        readyState: remoteVideoRef.current.readyState
+      });
     }
   };
 
@@ -504,42 +804,63 @@ const EnhancedVideoCall = ({
   };
 
   const cleanup = () => {
+    console.log('[VIDEO_CALL] 🧹 Starting cleanup...');
+    
     // Stop all tracks
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => track.stop());
+      console.log('[VIDEO_CALL] 🧹 Stopping local stream tracks');
+      localStreamRef.current.getTracks().forEach(track => {
+        console.log('[VIDEO_CALL] 🧹 Stopping track:', track.kind, track.label);
+        track.stop();
+      });
       localStreamRef.current = null;
     }
     
     if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(track => track.stop());
+      console.log('[VIDEO_CALL] 🧹 Stopping screen stream tracks');
+      screenStreamRef.current.getTracks().forEach(track => {
+        console.log('[VIDEO_CALL] 🧹 Stopping screen track:', track.kind, track.label);
+        track.stop();
+      });
       screenStreamRef.current = null;
     }
     
     // Close peer connection
     if (peerConnectionRef.current) {
+      console.log('[VIDEO_CALL] 🧹 Closing peer connection');
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
     }
     
     // Clear intervals
     if (durationIntervalRef.current) {
+      console.log('[VIDEO_CALL] 🧹 Clearing duration interval');
       clearInterval(durationIntervalRef.current);
       durationIntervalRef.current = null;
     }
     
     if (qualityCheckIntervalRef.current) {
+      console.log('[VIDEO_CALL] 🧹 Clearing quality check interval');
       clearInterval(qualityCheckIntervalRef.current);
       qualityCheckIntervalRef.current = null;
     }
     
     // Clear video elements
     if (localVideoRef.current) {
+      console.log('[VIDEO_CALL] 🧹 Clearing local video element');
       localVideoRef.current.srcObject = null;
     }
     
     if (remoteVideoRef.current) {
+      console.log('[VIDEO_CALL] 🧹 Clearing remote video element');
       remoteVideoRef.current.srcObject = null;
     }
+    
+    // Reset WebRTC setup flag
+    isWebRTCSetupRef.current = false;
+    currentCallIdRef.current = null;
+    
+    console.log('[VIDEO_CALL] 🧹 Cleanup completed');
   };
 
   const formatDuration = (seconds) => {
